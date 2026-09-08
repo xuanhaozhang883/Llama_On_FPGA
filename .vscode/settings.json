@@ -1,0 +1,10 @@
+{
+    "verilog.linting.linter": "none",
+    "verilog.linting.iverilog.arguments": "-g2012 -Y .sv -y rtl/core/online -y rtl/core/bc/softmax -y rtl/core/pv",
+    "verilog.linting.iverilog.includePath": [
+        "rtl/core/online",
+        "rtl/core/bc/softmax",
+        "rtl/core/pv"
+    ],
+    "verilog.linting.iverilog.runAtFileLocation": false
+}

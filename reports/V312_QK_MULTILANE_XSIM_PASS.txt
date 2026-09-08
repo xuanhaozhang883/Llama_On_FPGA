@@ -1,0 +1,15 @@
+V3.1.2 QK multi-lane Vivado 2018.3 XSIM: PASS
+
+Direct equivalence:
+  scores=2048
+  noncausal cycles lane1/lane2/lane4/lane8 = 23986/16162/12293/10577
+  causal cycles lane1/lane2/lane4/lane8    = 14752/10865/8928/7993
+
+Complete FlashAttention consumer integration:
+  lane1 contexts=64 cycles=871 PASS
+  lane2 contexts=64 cycles=641 PASS
+  lane4 contexts=64 cycles=641 PASS
+  lane8 contexts=64 cycles=641 PASS
+
+The SEQ_LEN=8 integration case has two physical column tiles, so lanes 4 and
+8 intentionally exercise inactive tail-lane behavior and match lane2 cycles.

@@ -1,0 +1,87 @@
+{
+  "bf16_weight_fused_vs_board_golden": {
+    "combined_failures": 0,
+    "different": 2686,
+    "elements": 11520,
+    "max_abs_error": 6.103515625e-05,
+    "max_ulp": 28056,
+    "over_one_ulp": 936,
+    "strict_abs_failures": 0
+  },
+  "configuration": {
+    "elements": 11520,
+    "evaluated_rows": 90,
+    "heads": [
+      0,
+      3,
+      4,
+      7,
+      8,
+      15,
+      16,
+      23,
+      24,
+      31
+    ],
+    "rows": [
+      0,
+      1,
+      3,
+      7,
+      15,
+      31,
+      63,
+      95,
+      127
+    ],
+    "rtl_exact_only": false,
+    "source": "authoritative v3.0 vitis/data board vectors",
+    "tile": 4
+  },
+  "fixed_l_fused_vs_board_golden": {
+    "combined_failures": 0,
+    "different": 2682,
+    "elements": 11520,
+    "max_abs_error": 6.103515625e-05,
+    "max_ulp": 28054,
+    "over_one_ulp": 934,
+    "strict_abs_failures": 0
+  },
+  "fused_vs_board_golden": {
+    "combined_failures": 0,
+    "different": 2682,
+    "elements": 11520,
+    "max_abs_error": 6.103515625e-05,
+    "max_ulp": 28054,
+    "over_one_ulp": 934,
+    "strict_abs_failures": 0
+  },
+  "fused_vs_v30_model": {
+    "combined_failures": 0,
+    "different": 1518,
+    "elements": 11520,
+    "max_abs_error": 6.103515625e-05,
+    "max_ulp": 220,
+    "over_one_ulp": 327,
+    "strict_abs_failures": 0
+  },
+  "rtl_combined_failure_examples": [],
+  "rtl_exact_vs_board_golden": {
+    "combined_failures": 0,
+    "different": 2684,
+    "elements": 11520,
+    "max_abs_error": 6.103515625e-05,
+    "max_ulp": 28056,
+    "over_one_ulp": 936,
+    "strict_abs_failures": 0
+  },
+  "v30_model_vs_board_golden": {
+    "combined_failures": 0,
+    "different": 2955,
+    "elements": 11520,
+    "max_abs_error": 6.103515625e-05,
+    "max_ulp": 28007,
+    "over_one_ulp": 1034,
+    "strict_abs_failures": 0
+  }
+}

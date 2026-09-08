@@ -1,0 +1,5 @@
+qk_lanes,clb_luts,clb_lut_pct,clb_registers,clb_register_pct,bram_tiles,dsp48e2,dsp_pct,target_mhz,wns_ns,vivado,part
+1,7521,2.20,16440,2.41,0,66,1.87,150,4.196,2018.3,xczu15eg-ffvb1156-2-i
+2,14974,4.39,32766,4.80,0,132,3.74,150,3.643645,2018.3,xczu15eg-ffvb1156-2-i
+4,29768,8.72,65418,9.58,0,264,7.48,150,3.104645,2018.3,xczu15eg-ffvb1156-2-i
+8,59480,17.43,130720,19.15,0,528,14.97,150,2.230646,2018.3,xczu15eg-ffvb1156-2-i

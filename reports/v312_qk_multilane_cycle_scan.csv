@@ -1,0 +1,5 @@
+qk_lanes,noncausal_cycles,noncausal_speedup_vs_lane1,noncausal_reduction_pct,causal_cycles,causal_speedup_vs_lane1,causal_reduction_pct
+1,23986,1.000,0.0,14752,1.000,0.0
+2,16162,1.484,32.6,10865,1.358,26.3
+4,12293,1.951,48.7,8928,1.652,39.5
+8,10577,2.268,55.9,7993,1.846,45.8

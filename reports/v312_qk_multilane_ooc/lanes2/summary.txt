@@ -1,0 +1,5 @@
+vivado=2018.3
+part=xczu15eg-ffvb1156-2-i
+qk_lanes=2
+target_mhz=150
+wns_ns=3.64364457130432129
