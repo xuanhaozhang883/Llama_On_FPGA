@@ -4,8 +4,9 @@
 `XCZU15EG-FFVB1156-2-I`。当前工程处理 DDR 中已经生成的 Q、K、V，
 完成 RoPE、QK、因果掩码、在线 Softmax、与 V 融合以及 Context 写回。
 
-它还不是完整的 Llama3-8B 推理系统。Embedding、RMSNorm、QKV/输出投影、
-MLP/SwiGLU、Residual、KV Cache、32层调度、LM Head 和 Token 采样尚未实现。
+它还不是完整的 Llama3-8B 推理系统。电脑端已有第 0 层 Embedding、
+RMSNorm 和 QKV 投影生成工具；板上尚未实现这些算子、输出投影、
+MLP/SwiGLU、Residual、KV Cache、32层调度、LM Head 和 Token 采样。
 
 ## 当前状态（2026-08-30）
 
@@ -93,6 +94,41 @@ attention_board_top
 
 Vivado 的生成工程默认放在源码目录旁的 `_fpt_v313_build/`，不应提交或
 复制回 `rtl/`。
+
+## 电脑端生成第 0 层 Q/K/V
+
+`python/prepare_llama3_qkv.py` 在电脑上依次完成 tokenizer、Embedding、
+第 0 层输入 RMSNorm、Q/K/V 线性投影；输出发生在 RoPE **之前**。脚本只
+读取实际用到的 Embedding 行，不会把整个 Embedding 权重加载到内存。
+
+请把已获授权的 Hugging Face 格式 Llama 3 8B 模型放在本地目录。目录至少
+需要 `config.json`、`tokenizer.json`（或 tokenizer 所需的其他文件）、
+`model.safetensors.index.json` 与其引用的权重分片；单文件权重
+`model.safetensors` 也可使用。所用 Python 环境需要 `numpy`、`torch`、
+`safetensors`、`transformers`。模型配置的 32 个 Q 头、8 个 KV 头、
+128 维 head 必须与本工程一致。
+
+```powershell
+python -m pip install numpy torch safetensors transformers
+python .\python\prepare_llama3_qkv.py --model-dir D:\models\Meta-Llama-3-8B --text "你好" --output-dir .\out\qkv_layer0
+```
+
+如果已有 token ID，可用 `--token-ids 128000 123 456` 代替 `--text`；
+此时脚本不会自动加 BOS。输入超过 128 个 token 会报错，不会静默截断。
+输出是 `q_before_rope_bf16.bin`、`k_before_rope_bf16.bin`、`v_bf16.bin`
+和 `manifest.json`。每个二进制文件都是小端 BF16，按
+`[head][token][dim]` 连续排列，分别对应 DDR 地址 `0x10000000`、
+`0x10100000`、`0x10140000`。有效 token 后面的行填零，仅用于满足板级
+固定 128 token 布局；那些位置不是模型真实输出。FP32 投影结果在输出时
+按最接近偶数规则转换为 BF16。`manifest.json` 记录有效长度、尺寸、
+字节数和 CRC32，可供后续 PS 接收程序检查。
+
+这一步只生成第 0 层 Q/K/V。更深层的输入需要前一层的 Attention 输出、
+输出投影、残差和 MLP 等，不能直接从 Embedding 再乘更深层 Q/K/V 权重。
+目前 `vitis/eth_echo` 只做 TCP 回显，`vitis/src/fpt_attention_board_test.c`
+仍从编译进程序的 Golden 数组加载 DDR；二者均不会接收上述文件并写入
+DDR。以太网调通后，PS 端还需按 `manifest.json` 的布局接收三个二进制
+区块、校验、写到对应 DDR 地址并刷新 DCache，才能启动现有 Attention RTL。
 
 ## 修改规则
 

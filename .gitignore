@@ -20,3 +20,6 @@ __pycache__/
 *.log
 *.vvp
 .DS_Store
+/out/
+/.venv-tokenizer/
+/.venv-tokenizer-clean/
