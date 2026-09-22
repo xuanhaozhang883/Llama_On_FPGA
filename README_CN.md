@@ -4,8 +4,8 @@
 `XCZU15EG-FFVB1156-2-I`。当前工程处理 DDR 中已经生成的 Q、K、V，
 完成 RoPE、QK、因果掩码、在线 Softmax、与 V 融合以及 Context 写回。
 
-它还不是完整的 Llama3-8B 推理系统。电脑端已有第 0 层 Embedding、
-RMSNorm 和 QKV 投影生成工具；板上尚未实现这些算子、输出投影、
+它还不是完整的 Llama3-8B 推理系统。电脑端已有独立 Embedding 步骤和
+第 0 层 RMSNorm、QKV 投影生成工具；板上尚未实现这些算子、输出投影、
 MLP/SwiGLU、Residual、KV Cache、32层调度、LM Head 和 Token 采样。
 
 ## 当前状态（2026-08-30）
@@ -95,40 +95,100 @@ attention_board_top
 Vivado 的生成工程默认放在源码目录旁的 `_fpt_v313_build/`，不应提交或
 复制回 `rtl/`。
 
-## 电脑端生成第 0 层 Q/K/V
+## 第 0 层前半层交付（2026-09-22）
 
-`python/prepare_llama3_qkv.py` 在电脑上依次完成 tokenizer、Embedding、
-第 0 层输入 RMSNorm、Q/K/V 线性投影；输出发生在 RoPE **之前**。脚本只
-读取实际用到的 Embedding 行，不会把整个 Embedding 权重加载到内存。
+共同目标固定为 `meta-llama/Llama-3.1-8B-Instruct`。当前交付包含 PC
+端 Tokenizer、Embedding、input RMSNorm、RoPE 前 Q/K/V，以及
+`residual_hidden_fp32.npy`；正式 Attention TCP 服务器仍待双方接口冻结后
+实现。责任划分、Fail-stop 和 DDR 预留约定见
+[交付约定](docs/layer0_handoff_contract.md)。这次代码同步不是最终接口冻结。
 
-请把已获授权的 Hugging Face 格式 Llama 3 8B 模型放在本地目录。目录至少
-需要 `config.json`、`tokenizer.json`（或 tokenizer 所需的其他文件）、
-`model.safetensors.index.json` 与其引用的权重分片；单文件权重
-`model.safetensors` 也可使用。所用 Python 环境需要 `numpy`、`torch`、
-`safetensors`、`transformers`。模型配置的 32 个 Q 头、8 个 KV 头、
-128 维 head 必须与本工程一致。
+### 获取同源模型
+
+本机原有 `D:\Llama_weight` 是旧 Llama 3 配置，不能代替目标模型。
+正确的 config、Tokenizer、索引和第 0 层所需分片必须来自同一个官方 commit。
+由前半层／服务器负责人准备交付包及逐文件 SHA-256；获取方法见
+[模型交付说明](docs/model_bundle.md)。模型文件保存在已忽略的 `out/models/`
+或仓库外，不提交 Git。
+
+使用获得官方仓库访问授权的 Hugging Face 账户在本机登录，不把令牌写入
+仓库或命令行参数。建议使用 Python 3.10+ 的独立环境：
 
 ```powershell
-python -m pip install numpy torch safetensors transformers
-python .\python\prepare_llama3_qkv.py --model-dir D:\models\Meta-Llama-3-8B --text "你好" --output-dir .\out\qkv_layer0
+python -m pip install numpy torch safetensors transformers huggingface_hub
+hf auth login
+python python/prepare_llama31_model.py --output-dir out/models --revision 0e9e39f249a16976918f6564b8830bc894c89659 --metadata-only
+python python/prepare_llama31_model.py --output-dir out/models --revision 0e9e39f249a16976918f6564b8830bc894c89659
 ```
 
-如果已有 token ID，可用 `--token-ids 128000 123 456` 代替 `--text`；
-此时脚本不会自动加 BOS。输入超过 128 个 token 会报错，不会静默截断。
-输出是 `q_before_rope_bf16.bin`、`k_before_rope_bf16.bin`、`v_bf16.bin`
-和 `manifest.json`。每个二进制文件都是小端 BF16，按
-`[head][token][dim]` 连续排列，分别对应 DDR 地址 `0x10000000`、
-`0x10100000`、`0x10140000`。有效 token 后面的行填零，仅用于满足板级
-固定 128 token 布局；那些位置不是模型真实输出。FP32 投影结果在输出时
-按最接近偶数规则转换为 BF16。`manifest.json` 记录有效长度、尺寸、
-字节数和 CRC32，可供后续 PS 接收程序检查。
+该 revision 为本次从官方仓库解析的完整 commit。脚本按索引选取 Embedding
+和完整第 0 层所需分片，不假设分片编号。完整下载并校验后才生成
+`model-bundle-manifest.json`；`bundle-plan.json` 只是元数据计划。
+本次访问目标 config 得到 403 未授权，因此尚未获得目标模型交付包，不能
+声称真实 Llama 3.1 数值验证通过。双方核验新模型和 Golden 前不替换 RoPE ROM。
 
-这一步只生成第 0 层 Q/K/V。更深层的输入需要前一层的 Attention 输出、
-输出投影、残差和 MLP 等，不能直接从 Embedding 再乘更深层 Q/K/V 权重。
-目前 `vitis/eth_echo` 只做 TCP 回显，`vitis/src/fpt_attention_board_test.c`
-仍从编译进程序的 Golden 数组加载 DDR；二者均不会接收上述文件并写入
-DDR。以太网调通后，PS 端还需按 `manifest.json` 的布局接收三个二进制
-区块、校验、写到对应 DDR 地址并刷新 DCache，才能启动现有 Attention RTL。
+### 生成 Token IDs、Embedding、QKV 和 Residual
+
+下面的解释器应安装上述依赖。将 `$modelDir` 指向完整交付包，先固定输入，
+双方后续联调使用生成的同一份 Token IDs，不各自重新分词。
+
+```powershell
+$modelDir = Resolve-Path './out/models/Llama-3.1-8B-Instruct-0e9e39f249a16976918f6564b8830bc894c89659'
+python python/tokenize_llama3.py --model-dir $modelDir --text '你好' --output out/embedding/token_ids.json
+python python/prepare_llama3_embedding.py --model-dir $modelDir --token-ids-file out/embedding/token_ids.json --output-dir out/embedding
+python python/verify_llama3_embedding.py --model-dir $modelDir --embedding-dir out/embedding
+python python/prepare_llama3_qkv.py --model-dir $modelDir --token-ids-file out/embedding/token_ids.json --embedding-dir out/embedding --device cpu --compute-dtype fp32 --num-threads 1 --output-dir out/qkv_layer0
+```
+
+也可以用 `scripts/run_embedding.ps1` 串联前三步，必须明确模型目录；
+`-TokenizerPython` 可指定独立分词环境，省略时复用 `-ComputePython`。
+例如在本机已安装的两个环境中：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/run_embedding.ps1 -Text '你好' -ModelDir $modelDir -ComputePython D:\ANACONDA\python.exe -TokenizerPython .\.venv-tokenizer-clean\Scripts\python.exe
+```
+
+脚本按磁盘偏移读取 safetensors 所需行／张量，不映射整个多 GB 分片。
+`--token-ids` 可直接指定 ID（不会自动添加 BOS）；输入长度要求 1–128，
+超过长度直接报错。`--text` 使用本地 Tokenizer，不联网。
+
+| 输出 | 类型和形状 | 用途 |
+|---|---|---|
+| `q_before_rope_bf16.bin` | BF16 小端 `[32,128,128]`，1,048,576 字节 | Q，DDR `0x10000000` |
+| `k_before_rope_bf16.bin` | BF16 小端 `[8,128,128]`，262,144 字节 | K，DDR `0x10100000` |
+| `v_bf16.bin` | BF16 小端 `[8,128,128]`，262,144 字节 | V，DDR `0x10140000` |
+| `residual_hidden_fp32.npy` | FP32 `[1,L,4096]` | RMSNorm 前 Embedding，留在 PC |
+| `manifest.json` | JSON | 同一输入的模型身份、Token IDs、文件哈希、CRC、精度和布局 |
+
+QKV 布局为 `[head][token][dim]` 连续存储，投影后第 L 行起补零；PL 仍按
+固定 128 行计算，只有前 `valid_tokens=L` 行用于真实模型验收。Residual
+不补零，也不发送给 PL。BF16 输出使用 round-to-nearest-even。
+
+默认 CPU / FP32 / 单线程，Manifest 记录实际 PyTorch/NumPy 版本、RMSNorm
+和投影精度。仍可显式选择 `--device auto|cuda` 或 `--compute-dtype bf16`，
+但这些是独立实验，不与首版基线混用。即使固定 CPU 配置，不同软件／CPU
+也不能先验保证完全相同的浮点结果；联调优先共享已校验的同一份二进制。
+
+新 Token IDs、Embedding 和 QKV metadata 记录 config、权重索引、Tokenizer
+哈希，并关联可用的模型交付清单。模型绝对路径仅作来源说明，可跨电脑移动。
+小文件哈希和清单身份校验不会每次重新扫描全部权重；模型分片应在交付时
+完成 SHA-256 校验并保持不变。旧 Manifest 兼容仅保留其原有哈希约束，不用作
+正式接口冻结的数据。
+
+`python/quantize_llama3_embedding.py` 与 `--int8-dir` 保留为可选实验。
+量化会改变 Embedding；该格式尚不提供完整源权重／量化数组内容认证，不用于
+首版正式 BF16 模型验收。
+
+### 验证和当前边界
+
+```powershell
+python -m unittest tests.test_prepare_llama3_qkv tests.test_prepare_llama31_model -v
+```
+
+测试使用小模型覆盖投影、Residual、布局、padding、BF16 舍入、跨目录交付、
+模型身份及获取流程；不等于真实目标模型或实板验收。
+当前 `vitis/eth_echo` 仍只做回显，`vitis/src/fpt_attention_board_test.c` 从
+编译进程序的 Golden 加载 DDR，尚未形成 QKV TCP 请求到 Context 响应的正式服务器。
 
 ## 修改规则
 
