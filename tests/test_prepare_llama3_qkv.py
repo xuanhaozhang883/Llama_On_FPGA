@@ -21,6 +21,24 @@ from python.verify_llama3_embedding import verify_embedding
 
 
 class PrepareLlama3QkvTest(unittest.TestCase):
+    def test_projection_rejects_empty_or_overlength_token_lists(self):
+        with tempfile.TemporaryDirectory() as td:
+            model = Path(td) / "model"
+            model.mkdir()
+            config = {
+                "model_type": "llama",
+                "hidden_size": 8,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "head_dim": 4,
+            }
+            (model / "config.json").write_text(json.dumps(config), encoding="utf-8")
+            board = {"q_heads": 2, "kv_heads": 1, "head_dim": 4, "seq_len": 4}
+
+            for ids in ([], [0, 1, 2, 3, 4]):
+                with self.subTest(ids=ids), self.assertRaisesRegex(ValueError, "1～4"):
+                    project_layer0(model, ids, board)
+
     def test_projection_layout_padding_and_bf16(self):
         with tempfile.TemporaryDirectory() as td:
             model = Path(td) / "model"
