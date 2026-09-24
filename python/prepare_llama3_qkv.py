@@ -97,10 +97,12 @@ def model_metadata(model_dir: Path) -> dict:
     config = json.loads(config_bytes)
     index = model_dir / "model.safetensors.index.json"
     tokenizer_files = ("tokenizer.json", "tokenizer_config.json", "special_tokens_map.json")
-    relevant = ("_name_or_path", "model_type", "hidden_size", "num_hidden_layers",
-                "num_attention_heads", "num_key_value_heads", "head_dim",
-                "vocab_size", "rms_norm_eps", "max_position_embeddings",
-                "torch_dtype", "dtype", "rope_theta", "rope_scaling", "rope_parameters")
+    model_config_fields = (
+        "_name_or_path", "model_type", "hidden_size", "intermediate_size",
+        "num_hidden_layers", "num_attention_heads", "num_key_value_heads",
+        "head_dim", "vocab_size", "rms_norm_eps", "max_position_embeddings",
+        "torch_dtype", "dtype", "rope_theta", "rope_scaling", "rope_parameters",
+    )
     metadata = {
         "model_dir": str(model_dir.resolve()),
         "config_sha256": hashlib.sha256(config_bytes).hexdigest(),
@@ -110,7 +112,7 @@ def model_metadata(model_dir: Path) -> dict:
             name: hashlib.sha256((model_dir / name).read_bytes()).hexdigest()
             for name in tokenizer_files if (model_dir / name).is_file()
         },
-        "model_config": {key: config[key] for key in relevant if key in config},
+        "model_config": {key: config.get(key) for key in model_config_fields},
         "model_bundle_sha256": None,
         "model_bundle": None,
     }

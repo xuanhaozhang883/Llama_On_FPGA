@@ -47,7 +47,7 @@ class PrepareLlama3QkvTest(unittest.TestCase):
             cfg = {"model_type": "llama", "hidden_size": 8,
                    "num_attention_heads": 2, "num_key_value_heads": 1,
                    "head_dim": 4, "rms_norm_eps": 1e-5,
-                   "rope_theta": 500000.0, "rope_scaling": {"rope_type": "llama3", "factor": 8.0}}
+                   "rope_theta": 500000.0, "rope_scaling": None}
             (model / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
             embedding = torch.arange(10 * 8, dtype=torch.float32).reshape(10, 8) / 16
             norm = torch.arange(1, 9, dtype=torch.float32) / 8
@@ -82,9 +82,10 @@ class PrepareLlama3QkvTest(unittest.TestCase):
             self.assertEqual(manifest["valid_tokens"], 2)
             self.assertEqual(manifest["token_ids"], ids)
             self.assertEqual(manifest["config_sha256"], hashlib.sha256((model / "config.json").read_bytes()).hexdigest())
-            self.assertEqual(manifest["model_config"]["rope_scaling"], cfg["rope_scaling"])
+            self.assertEqual(manifest["model_config"]["rope_theta"], 500000.0)
+            self.assertIsNone(manifest["model_config"]["rope_scaling"])
+            self.assertIsNone(manifest["model_config"]["rope_parameters"])
             self.assertIsNone(manifest["weight_index_sha256"])
-            self.assertNotIn("rope_parameters", manifest["model_config"])
             residual = manifest["files"]["residual_hidden"]
             self.assertEqual(residual["shape"], [1, 2, 8])
             residual_path = output / residual["file"]
@@ -207,6 +208,18 @@ class PrepareLlama3QkvTest(unittest.TestCase):
             path.write_text(json.dumps(data), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "无效"):
                 load_token_ids_file(path, model)
+
+    def test_model_metadata_records_absent_rope_scaling_as_none(self):
+        with tempfile.TemporaryDirectory() as td:
+            model = Path(td)
+            (model / "config.json").write_text(json.dumps({
+                "model_type": "llama",
+                "rope_theta": 500000.0,
+            }), encoding="utf-8")
+            metadata = model_metadata(model)
+            self.assertEqual(metadata["model_config"]["rope_theta"], 500000.0)
+            self.assertIsNone(metadata["model_config"]["rope_scaling"])
+            self.assertIsNone(metadata["model_config"]["rope_parameters"])
 
     def test_token_ids_are_portable_but_tokenizer_changes_are_rejected(self):
         with tempfile.TemporaryDirectory() as td:
