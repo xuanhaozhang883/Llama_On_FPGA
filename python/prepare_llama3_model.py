@@ -1,4 +1,4 @@
-"""Acquire a pinned, verified official Llama 3.1 layer-0 model bundle.
+"""Acquire a pinned, verified official Llama 3 Base layer-0 model bundle.
 
 Uses huggingface_hub's existing authentication and resumable downloads. A plan
 is not a complete bundle; only model-bundle-manifest.json signals completion.
@@ -9,12 +9,14 @@ import hashlib
 import json
 import re
 import sys
+from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
 
 from huggingface_hub import HfApi, hf_hub_download
 
 
-REPO_ID = "meta-llama/Llama-3.1-8B-Instruct"
+REPO_ID = "meta-llama/Meta-Llama-3-8B"
+BUNDLE_PREFIX = "Meta-Llama-3-8B"
 MANIFEST = "model-bundle-manifest.json"
 PLAN = "bundle-plan.json"
 REQUIRED_FILES = (
@@ -36,12 +38,15 @@ class BundleError(ValueError):
     """An invalid or incomplete model bundle; safe to display to the user."""
 
 
-def validate_config(config):
+def validate_config(config: Mapping[str, object]) -> None:
+    if config.get("rope_scaling") is not None or config.get("rope_parameters") is not None:
+        raise BundleError("Target Llama 3 requires unscaled RoPE")
     expected = {
         "model_type": "llama", "hidden_size": 4096, "intermediate_size": 14336,
         "num_hidden_layers": 32, "num_attention_heads": 32,
         "num_key_value_heads": 8, "vocab_size": 128256,
-        "max_position_embeddings": 131072, "rms_norm_eps": 1e-5,
+        "max_position_embeddings": 8192, "rms_norm_eps": 1e-5,
+        "rope_theta": 500000.0,
     }
     for name, value in expected.items():
         if config.get(name) != value:
@@ -52,24 +57,8 @@ def validate_config(config):
         raise BundleError("Target config head_dim must equal 128")
     if config.get("torch_dtype", config.get("dtype")) != "bfloat16":
         raise BundleError("Target config dtype must be bfloat16")
-    blocks = [config[key] for key in ("rope_scaling", "rope_parameters")
-              if config.get(key) is not None]
-    if not blocks:
-        raise BundleError("Llama 3.1 requires scaled RoPE; null/missing scaling is rejected")
-    for block in blocks:
-        if not isinstance(block, dict):
-            raise BundleError("RoPE parameters must be an object")
-        if block.get("rope_type", block.get("type")) != "llama3":
-            raise BundleError("Target config requires llama3 scaled RoPE")
-        for name, value in (("factor", 8.0), ("low_freq_factor", 1.0),
-                            ("high_freq_factor", 4.0),
-                            ("original_max_position_embeddings", 8192)):
-            if block.get(name) != value:
-                raise BundleError(f"Target config RoPE {name} must equal {value!r}")
-        if block.get("rope_theta", config.get("rope_theta")) != 500000.0:
-            raise BundleError("Target config rope_theta must equal 500000.0")
-    if "rope_theta" in config and config["rope_theta"] != 500000.0:
-        raise BundleError("Target config rope_theta must equal 500000.0")
+    if config.get("attention_bias", False) or config.get("mlp_bias", False):
+        raise BundleError("Target config must not use Attention or MLP bias")
 
 
 def safe_repo_filename(name):
@@ -81,7 +70,7 @@ def safe_repo_filename(name):
     return name
 
 
-def select_tensors(index):
+def select_tensors(index: Mapping[str, object]) -> dict[str, str]:
     mapping = index.get("weight_map")
     if not isinstance(mapping, dict):
         raise BundleError("Weight index is missing weight_map")
@@ -149,7 +138,7 @@ def prepare_bundle(output_dir, revision="main", metadata_only=False,
         raise BundleError("Hub did not return a full 40-character commit SHA")
     if re.fullmatch(r"[0-9a-f]{40}", revision) and revision != commit:
         raise BundleError("Resolved commit differs from the requested immutable revision")
-    bundle = Path(output_dir).resolve() / f"Llama-3.1-8B-Instruct-{commit}"
+    bundle = Path(output_dir).resolve() / f"{BUNDLE_PREFIX}-{commit}"
     if bundle.is_symlink():
         raise BundleError("Bundle directory must not be a symlink")
     bundle.mkdir(parents=True, exist_ok=True)

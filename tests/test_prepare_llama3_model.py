@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from python.prepare_llama31_model import (
+from python.prepare_llama3_model import (
     BundleError, MANIFEST, PLAN, REPO_ID, REQUIRED_TENSORS,
     prepare_bundle, select_tensors, validate_config,
 )
@@ -19,11 +19,9 @@ CONFIG = {
     "architectures": ["LlamaForCausalLM"], "model_type": "llama",
     "hidden_size": 4096, "intermediate_size": 14336, "num_hidden_layers": 32,
     "num_attention_heads": 32, "num_key_value_heads": 8, "vocab_size": 128256,
-    "max_position_embeddings": 131072, "rms_norm_eps": 1e-5,
+    "max_position_embeddings": 8192, "rms_norm_eps": 1e-5,
     "torch_dtype": "bfloat16", "rope_theta": 500000.0,
-    "rope_scaling": {"rope_type": "llama3", "factor": 8.0,
-                     "low_freq_factor": 1.0, "high_freq_factor": 4.0,
-                     "original_max_position_embeddings": 8192},
+    "rope_scaling": None, "attention_bias": False, "mlp_bias": False,
 }
 
 
@@ -72,7 +70,7 @@ class FakeHub:
         return str(target)
 
 
-class PrepareLlama31ModelTest(unittest.TestCase):
+class PrepareLlama3ModelTest(unittest.TestCase):
     def test_complete_bundle_pins_revision_selects_index_shards_and_hashes_all_files(self):
         hub = FakeHub()
         with tempfile.TemporaryDirectory() as temp:
@@ -80,8 +78,14 @@ class PrepareLlama31ModelTest(unittest.TestCase):
             self.assertEqual(hub.info_calls[0][1]["revision"], "moving-branch")
             self.assertTrue(all(call["revision"] == COMMIT for call in hub.calls))
             self.assertTrue(all(call["repo_id"] == REPO_ID for call in hub.calls))
+            self.assertEqual(REPO_ID, "meta-llama/Meta-Llama-3-8B")
+            self.assertEqual(path.parent.name, f"Meta-Llama-3-8B-{COMMIT}")
             self.assertEqual(path.name, MANIFEST)
             self.assertEqual(manifest["status"], "complete")
+            self.assertEqual(manifest["repo_id"], REPO_ID)
+            self.assertEqual(manifest["revision"], COMMIT)
+            self.assertEqual(manifest["rope"]["rope_theta"], 500000.0)
+            self.assertIsNone(manifest["rope"]["rope_scaling"])
             self.assertEqual(manifest["required_weight_shards"], ["embedding-part.safetensors",
                               "layer-extra.safetensors", "layer-zero.safetensors"])
             self.assertNotIn("unused.safetensors", manifest["files"])
@@ -100,29 +104,33 @@ class PrepareLlama31ModelTest(unittest.TestCase):
             self.assertEqual(plan["status"], "metadata_only_weights_pending")
             self.assertEqual(plan["files"]["layer-zero.safetensors"]["verification"], "pending")
 
-    def test_old_llama3_config_is_rejected_before_other_downloads(self):
-        old = copy.deepcopy(CONFIG)
-        old["max_position_embeddings"] = 8192
-        old["rope_scaling"] = None
-        hub = FakeHub(old)
+    def test_llama3_base_config_is_accepted(self):
+        validate_config(copy.deepcopy(CONFIG))
+
+    def test_llama31_scaled_rope_is_rejected_before_other_downloads(self):
+        scaled = copy.deepcopy(CONFIG)
+        scaled["max_position_embeddings"] = 131072
+        scaled["rope_scaling"] = {
+            "rope_type": "llama3", "factor": 8.0,
+            "low_freq_factor": 1.0, "high_freq_factor": 4.0,
+            "original_max_position_embeddings": 8192,
+        }
+        hub = FakeHub(scaled)
         with tempfile.TemporaryDirectory() as temp:
-            with self.assertRaises(BundleError):
+            with self.assertRaisesRegex(BundleError, "unscaled"):
                 prepare_bundle(temp, api=hub, downloader=hub.download)
             self.assertEqual([call["filename"] for call in hub.calls], ["config.json"])
             self.assertEqual(list(Path(temp).rglob(MANIFEST)), [])
 
-    def test_rope_validation_including_alternate_parameters_field(self):
-        altered = copy.deepcopy(CONFIG)
-        altered["rope_scaling"]["high_freq_factor"] = 1.0
-        with self.assertRaises(BundleError):
-            validate_config(altered)
-        alternate = copy.deepcopy(CONFIG)
-        alternate["rope_parameters"] = alternate.pop("rope_scaling")
-        alternate["rope_parameters"]["rope_theta"] = alternate.pop("rope_theta")
-        validate_config(alternate)
-        alternate["rope_scaling"] = {"rope_type": "default"}
-        with self.assertRaises(BundleError):
-            validate_config(alternate)
+    def test_any_non_null_rope_scaling_or_parameters_is_rejected(self):
+        for field, value in (
+                ("rope_scaling", {}),
+                ("rope_scaling", {"rope_type": "default"}),
+                ("rope_parameters", {"rope_type": "default"})):
+            candidate = copy.deepcopy(CONFIG)
+            candidate[field] = value
+            with self.subTest(field=field, value=value), self.assertRaises(BundleError):
+                validate_config(candidate)
 
     def test_missing_required_tensor_and_escaping_shard_are_rejected(self):
         mapping = FakeHub().mapping
@@ -158,7 +166,7 @@ class PrepareLlama31ModelTest(unittest.TestCase):
     def test_unrelated_file_cannot_be_mistaken_for_this_model(self):
         hub = FakeHub()
         with tempfile.TemporaryDirectory() as temp:
-            folder = Path(temp) / f"Llama-3.1-8B-Instruct-{COMMIT}"
+            folder = Path(temp) / f"Meta-Llama-3-8B-{COMMIT}"
             folder.mkdir()
             (folder / "model.safetensors").write_bytes(b"unrelated old weights")
             with self.assertRaisesRegex(BundleError, "Unrelated file"):
