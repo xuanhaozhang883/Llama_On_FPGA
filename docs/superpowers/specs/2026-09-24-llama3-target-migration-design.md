@@ -1,6 +1,6 @@
 # Llama 3.1 → Llama 3 目标模型迁移设计
 
-> 日期：2026-09-24  
+> 日期：2026-09-24
 > 目标：将第0层 PC–FPGA–PC 闭环的唯一目标，从
 > `meta-llama/Llama-3.1-8B-Instruct` 改为
 > `meta-llama/Meta-Llama-3-8B` Base模型。
@@ -117,4 +117,3 @@ TCP字段、张量字节数、DDR地址和Fail-stop语义不改。
 - 当前ROM的4字差异已有证据化结论；
 - 未获得revision/官方哈希时，正式模型身份保持`NOT RUN`或`identity_unverified`；
 - 没有修改FPGA RoPE数据通路RTL。
-
