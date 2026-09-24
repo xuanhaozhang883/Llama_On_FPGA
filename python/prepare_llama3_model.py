@@ -202,10 +202,15 @@ def audit_local_bundle(model_dir: Path) -> dict:
 
 
 def write_local_audit(model_dir: Path, output_dir: Path) -> tuple[Path, dict]:
-    report = audit_local_bundle(model_dir)
+    model_dir = Path(model_dir).resolve()
     output_dir = Path(output_dir).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if output_dir == model_dir or model_dir in output_dir.parents:
+        raise BundleError("审计输出目录不得等于或位于模型目录内部")
     artifact = output_dir / LOCAL_AUDIT
+    # Revoke stale success evidence before revalidating the model assets.
+    artifact.unlink(missing_ok=True)
+    report = audit_local_bundle(model_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     write_json_atomic(artifact, report)
     return artifact, report
 

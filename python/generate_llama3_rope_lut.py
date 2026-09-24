@@ -189,6 +189,9 @@ def compare_roms(
     candidate_dir = Path(candidate_dir).resolve()
     current_rom_dir = Path(current_rom_dir).resolve()
     report_path = Path(report_path).resolve()
+    for input_dir in (candidate_dir, current_rom_dir):
+        if report_path == input_dir or input_dir in report_path.parents:
+            raise ValueError("对比报告不得写入任一输入目录")
     manifest_path = candidate_dir / MANIFEST_FILE
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     seq_len = int(manifest["seq_len"])

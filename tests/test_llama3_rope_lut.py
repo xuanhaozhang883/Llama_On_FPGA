@@ -128,6 +128,31 @@ class Llama3RopeLutTest(unittest.TestCase):
             self.assertFalse(report["mismatches"][0]["current_matches_numpy_fp64"])
             self.assertEqual(json.loads(report_path.read_text(encoding="utf-8")), report)
 
+    def test_comparison_refuses_report_inside_input_directories(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps(CONFIG), encoding="utf-8")
+            candidate = root / "candidate"
+            write_lut_bundle(
+                config_path, candidate, forbidden_rom_dir=ROOT / "mem")
+            current = root / "current"
+            shutil.copytree(candidate, current)
+            original_sin = (current / "sin_bf16.hex").read_bytes()
+            original_cos = (current / "cos_bf16.hex").read_bytes()
+
+            for report_path in (
+                current / "sin_bf16.hex",
+                current / "reports" / "rom-comparison.json",
+                candidate / "rom-comparison.json",
+            ):
+                with self.subTest(report_path=report_path):
+                    with self.assertRaisesRegex(ValueError, "输入目录"):
+                        compare_roms(candidate, current, report_path)
+
+            self.assertEqual((current / "sin_bf16.hex").read_bytes(), original_sin)
+            self.assertEqual((current / "cos_bf16.hex").read_bytes(), original_cos)
+
 
 if __name__ == "__main__":
     unittest.main()

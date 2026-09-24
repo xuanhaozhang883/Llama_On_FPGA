@@ -126,6 +126,32 @@ class PrepareLlama3ModelTest(unittest.TestCase):
             with self.assertRaisesRegex(BundleError, "不完整|大小"):
                 audit_local_bundle(model)
 
+    def test_failed_reaudit_revokes_previous_success_report(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            model = write_local_fixture(root)
+            output = root / "audit"
+            artifact, _ = write_local_audit(model, output)
+            self.assertTrue(artifact.is_file())
+            shard = model / "model-00001-of-00004.safetensors"
+            shard.write_bytes(shard.read_bytes()[:-1])
+
+            with self.assertRaisesRegex(BundleError, "不完整|大小"):
+                write_local_audit(model, output)
+
+            self.assertFalse(artifact.exists())
+
+    def test_local_audit_refuses_output_inside_source_model(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            model = write_local_fixture(root)
+            for output in (model, model / "reports"):
+                with self.subTest(output=output):
+                    with self.assertRaisesRegex(BundleError, "模型目录"):
+                        write_local_audit(model, output)
+            self.assertFalse((model / "local-model-audit.json").exists())
+            self.assertFalse((model / "reports").exists())
+
     def test_local_audit_rejects_missing_layer0_shard(self):
         with tempfile.TemporaryDirectory() as temp:
             model = write_local_fixture(Path(temp))
