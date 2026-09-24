@@ -16,6 +16,7 @@ releases/*.zip
 releases/_audit_extract/
 __pycache__/
 *.pyc
+*.safetensors
 *.jou
 *.log
 *.vvp
