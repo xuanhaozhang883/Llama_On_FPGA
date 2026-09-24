@@ -1,41 +1,66 @@
-# Llama 3.1 第 0 层模型交付包
+# Llama 3 Base第0层模型文件检查与交付
 
-目标固定为官方 `meta-llama/Llama-3.1-8B-Instruct`。由前半层及服务器负责人准备并交付同源 config、Tokenizer、权重索引、Embedding 与完整第 0 层所需分片，以及逐文件 SHA-256。旧 `D:\Llama_weight` 不作为该目标的来源，也不由此脚本修改。
+当前唯一目标是官方`meta-llama/Meta-Llama-3-8B` Base。当前里程碑只验证decoder第0层，不使用Instruct聊天模板，也不需要`chat_template`。
 
-需要已安装 `huggingface_hub`，并使用已经获准访问该仓库的 Hugging Face 登录。脚本复用本机认证，不接收或打印 token。请勿将 token 写入命令行、仓库或交付文件。
+本项目区分两种检查结果：
 
-## 先检查元数据
+- **本地冒烟审计**：确认朋友拷贝来的文件能否支持第0层计算，但不能证明文件来自哪个官方revision。
+- **正式模型交付**：从官方仓库固定到40位commit SHA，校验Hub提供的Git/LFS摘要，再生成状态为`complete`的Manifest。
 
-在仓库根目录执行：
+## 检查当前本地目录
 
-```powershell
-D:\ANACONDA\python.exe python/prepare_llama31_model.py --output-dir out/models --revision main --metadata-only
-```
-
-脚本首先把 revision 解析为完整的 40 位 commit SHA，后续所有文件均从该 commit 获取。它下载 config、Tokenizer 和索引等小文件，验证 Llama 3.1 8B 的结构及 `llama3` scaled-RoPE 参数；根据索引找出 Embedding 和第 0 层的全部分片。不会假设所需权重都在第一个分片。
-
-输出在 `out/models/Llama-3.1-8B-Instruct-<完整commit>/bundle-plan.json`。这个文件仅为计划，状态为 `metadata_only_weights_pending`，其中权重分片尚未获得本地 SHA-256，不能当作完成交付。
-
-## 下载分片并完成清单
-
-使用计划中记录的完整 commit 替换下面占位符：
+在工作树根目录执行：
 
 ```powershell
-D:\ANACONDA\python.exe python/prepare_llama31_model.py --output-dir out/models --revision <完整commit>
+.\.venv\Scripts\python.exe python\prepare_llama3_model.py `
+  --local-model-dir "C:\lhm\2_Work\Llama3-8B" `
+  --output-dir "out\llama3-model-audit"
 ```
 
-同样的命令可以重复执行，Hugging Face 库复用缓存并支持中断后继续下载。输出与旧模型隔离在独立的 commit 目录；发现目录中不属于本次交付的文件时拒绝继续。
+结果写入`out/llama3-model-audit/local-model-audit.json`。在没有官方revision和远端摘要时，状态必须是`identity_unverified`。
 
-脚本流式计算每个文件的 SHA-256，并校验 Hub 提供的 Git blob ID 或 LFS SHA-256。所有所需文件通过后，原子写入 `model-bundle-manifest.json`；失败时不会生成新的完成清单，重新验证前会撤销当前目录原有的完成清单。遇到本地文件损坏，可以添加 `--force-download` 重新获取。
+报告分别记录：
 
-清单包含来源 repo、固定 revision、完整 config、RoPE 字段、逐 tensor 到 shard 的映射、逐文件大小和 SHA-256。它只保证 Embedding 及完整第 0 层所需的交付，不表示已经下载完整的 32 层模型。获得正式清单并由双方核验前，不替换 RoPE ROM。
+- `layer0_assets_complete`：Embedding和第0层所需文件是否齐全、Safetensors结构是否完整；
+- `full_model_files_complete`：索引引用的全部32层分片是否都在本地；
+- `missing_full_model_shards`：缺少的完整模型分片；
+- 本地配置、索引、Tokenizer和第0层所需分片的大小及SHA-256。
 
-## 验证脚本
+第0层全部张量位于第1分片，只能说明第0层可以测试。当前缺少第2、3分片，因此不能宣称完整32层模型可用。
+
+## 将来完成正式交付
+
+获得官方受限仓库访问权限后执行：
 
 ```powershell
-D:\ANACONDA\python.exe -m unittest tests.test_prepare_llama31_model -v
+.\.venv\Scripts\python.exe python\prepare_llama3_model.py `
+  --output-dir "out\models" `
+  --revision main
 ```
 
-测试使用小型本地 fixture 覆盖 revision 固定、索引分片选择、远端及本地哈希校验、旧模型配置拒绝、下载失败及恢复，以及无关文件隔离；无需下载实际模型。
+程序首先将`main`解析成不可变的40位commit SHA，然后下载同一revision的配置、Tokenizer、权重索引和第0层所需分片。所有文件通过远端Git blob或LFS SHA-256检查后，才会原子写入`model-bundle-manifest.json`并标记`complete`。
 
-参考：[官方模型仓库](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct)、[Hugging Face 固定版本下载及本地缓存说明](https://huggingface.co/docs/huggingface_hub/guides/download)。
+只检查元数据而不下载权重时可以增加`--metadata-only`。这只会生成`bundle-plan.json`和`metadata_only_weights_pending`状态，不能作为正式完成证明。
+
+## 配置边界
+
+目标配置必须满足：
+
+- 32层、hidden 4096、32个Q头、8个KV头、head_dim 128；
+- intermediate 14336、vocab 128256、BF16权重；
+- `max_position_embeddings=8192`；
+- `rope_theta=500000`；
+- `rope_scaling`与`rope_parameters`缺失或为`null`；
+- 不使用Attention或MLP bias。
+
+模型检查通过不等于RoPE ROM已经签核。候选LUT与当前ROM的差异必须单独调查，未经确认不得覆盖`mem/sin_bf16.hex`或`mem/cos_bf16.hex`。
+
+## 软件测试
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest tests.test_prepare_llama3_model -v
+```
+
+测试使用本地小型fixture，不访问真实Hugging Face仓库，也不读取16 GB模型。
+
+参考：[Meta-Llama-3-8B官方模型仓库](https://huggingface.co/meta-llama/Meta-Llama-3-8B)、[Hugging Face固定版本下载说明](https://huggingface.co/docs/huggingface_hub/guides/download)。

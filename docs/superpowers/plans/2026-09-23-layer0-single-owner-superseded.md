@@ -1,5 +1,7 @@
 # Llama 3.1 8B 第 0 层 PC–FPGA–PC 单人实施计划
 
+> **历史文档，已被取代：** 本计划不再执行。当前目标与实施步骤以`docs/superpowers/specs/2026-09-24-llama3-target-migration-design.md`和`docs/superpowers/plans/2026-09-24-llama3-target-migration.md`为准。
+
 > 日期：2026-09-23  
 > 状态：已规划，尚未开始功能实现  
 > 设计依据：`docs/superpowers/specs/2026-09-23-layer0-single-owner-design.md`
