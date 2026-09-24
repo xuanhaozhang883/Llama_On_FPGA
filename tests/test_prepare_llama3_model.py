@@ -4,6 +4,8 @@ import copy
 import hashlib
 import io
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -29,6 +31,7 @@ CONFIG = {
     "torch_dtype": "bfloat16", "rope_theta": 500000.0,
     "rope_scaling": None, "attention_bias": False, "mlp_bias": False,
 }
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def write_local_fixture(root: Path) -> Path:
@@ -96,6 +99,12 @@ class FakeHub:
 
 
 class PrepareLlama3ModelTest(unittest.TestCase):
+    def test_cli_entrypoint_runs_as_a_script(self):
+        completed = subprocess.run(
+            [sys.executable, str(ROOT / "python" / "prepare_llama3_model.py"), "--help"],
+            cwd=ROOT, capture_output=True, text=True, check=False)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def test_local_audit_separates_layer0_from_full_model_completeness(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

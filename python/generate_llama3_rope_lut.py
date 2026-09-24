@@ -14,7 +14,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from python.prepare_llama3_model import BundleError, REPO_ID, validate_config
+if __package__:
+    from .prepare_llama3_model import BundleError, REPO_ID, validate_config
+else:
+    from prepare_llama3_model import BundleError, REPO_ID, validate_config
 
 
 SIN_FILE = "sin_bf16.hex"

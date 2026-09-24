@@ -2,6 +2,8 @@
 
 import json
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -49,6 +51,13 @@ def torch_reference(config, seq_len=128, head_dim=128):
 
 
 class Llama3RopeLutTest(unittest.TestCase):
+    def test_cli_entrypoint_runs_as_a_script(self):
+        completed = subprocess.run(
+            [sys.executable, str(ROOT / "python" / "generate_llama3_rope_lut.py"),
+             "--help"],
+            cwd=ROOT, capture_output=True, text=True, check=False)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def test_full_lut_matches_independent_torch_reference(self):
         actual_sin, actual_cos = generate_rope_words(CONFIG)
         expected_sin, expected_cos = torch_reference(CONFIG)

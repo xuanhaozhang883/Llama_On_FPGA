@@ -14,7 +14,10 @@ from pathlib import Path, PurePosixPath
 
 from huggingface_hub import HfApi, hf_hub_download
 
-from python.safetensors_stream import SafeTensorReader
+if __package__:
+    from .safetensors_stream import SafeTensorReader
+else:
+    from safetensors_stream import SafeTensorReader
 
 
 REPO_ID = "meta-llama/Meta-Llama-3-8B"
