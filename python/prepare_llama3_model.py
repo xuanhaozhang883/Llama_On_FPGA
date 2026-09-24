@@ -14,11 +14,14 @@ from pathlib import Path, PurePosixPath
 
 from huggingface_hub import HfApi, hf_hub_download
 
+from python.safetensors_stream import SafeTensorReader
+
 
 REPO_ID = "meta-llama/Meta-Llama-3-8B"
 BUNDLE_PREFIX = "Meta-Llama-3-8B"
 MANIFEST = "model-bundle-manifest.json"
 PLAN = "bundle-plan.json"
+LOCAL_AUDIT = "local-model-audit.json"
 REQUIRED_FILES = (
     "config.json", "model.safetensors.index.json", "tokenizer.json",
     "tokenizer_config.json", "special_tokens_map.json",
@@ -127,6 +130,83 @@ def write_json_atomic(path, data):
     temporary.replace(path)
 
 
+def _read_json_object(path: Path, label: str) -> dict:
+    if not path.is_file():
+        raise BundleError(f"本地模型缺少{label}: {path.name}")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        raise BundleError(f"本地模型的{label}不是有效JSON: {path.name}") from error
+    if not isinstance(value, dict):
+        raise BundleError(f"本地模型的{label}必须是JSON对象: {path.name}")
+    return value
+
+
+def audit_local_bundle(model_dir: Path) -> dict:
+    """Audit local layer-zero assets without asserting official provenance."""
+    model_dir = Path(model_dir).resolve()
+    config_path = model_dir / "config.json"
+    index_path = model_dir / "model.safetensors.index.json"
+    config = _read_json_object(config_path, "配置")
+    validate_config(config)
+    index = _read_json_object(index_path, "权重索引")
+    tensors = select_tensors(index)
+    mapping = index.get("weight_map")
+    if not isinstance(mapping, dict):
+        raise BundleError("Weight index is missing weight_map")
+    all_index_shards = sorted({safe_repo_filename(name) for name in mapping.values()})
+    required_layer0_shards = sorted(set(tensors.values()))
+    missing_full_shards = [name for name in all_index_shards
+                           if not (model_dir / name).is_file()]
+
+    for shard_name in required_layer0_shards:
+        shard_path = model_dir / shard_name
+        if not shard_path.is_file():
+            raise BundleError(f"第0层所需分片缺失: {shard_name}")
+        try:
+            with SafeTensorReader(shard_path) as reader:
+                for tensor_name, mapped_shard in tensors.items():
+                    if mapped_shard == shard_name:
+                        reader.shape(tensor_name)
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            raise BundleError(
+                f"第0层分片不完整或格式错误: {shard_name}") from error
+
+    local_files = [*REQUIRED_FILES, *required_layer0_shards]
+    file_records = {}
+    for name in dict.fromkeys(local_files):
+        path = model_dir / name
+        if not path.is_file():
+            raise BundleError(f"本地模型缺少必要文件: {name}")
+        size, sha256, _ = file_hashes(path)
+        file_records[name] = {"size_bytes": size, "sha256": sha256}
+
+    return {
+        "schema_version": 1,
+        "status": "identity_unverified",
+        "repo_id": REPO_ID,
+        "revision": None,
+        "scope": "Embedding and decoder layer 0 local smoke validation",
+        "layer0_assets_complete": True,
+        "full_model_files_complete": not missing_full_shards,
+        "required_layer0_shards": required_layer0_shards,
+        "all_index_shards": all_index_shards,
+        "missing_full_model_shards": missing_full_shards,
+        "tensor_to_shard": tensors,
+        "config": config,
+        "files": dict(sorted(file_records.items())),
+    }
+
+
+def write_local_audit(model_dir: Path, output_dir: Path) -> tuple[Path, dict]:
+    report = audit_local_bundle(model_dir)
+    output_dir = Path(output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    artifact = output_dir / LOCAL_AUDIT
+    write_json_atomic(artifact, report)
+    return artifact, report
+
+
 def prepare_bundle(output_dir, revision="main", metadata_only=False,
                    force_download=False, api=None, downloader=None):
     api = api if api is not None else HfApi()
@@ -205,17 +285,26 @@ def prepare_bundle(output_dir, revision="main", metadata_only=False,
     return artifact, result
 
 
-def main():
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", required=True, type=Path,
-                        help="Root for a new directory named after the exact model commit")
+                        help="Remote bundle root or local audit output directory")
+    parser.add_argument("--local-model-dir", type=Path,
+                        help="Audit an existing local model without claiming official identity")
     parser.add_argument("--revision", default="main", help="HF ref, resolved to a full commit before downloads")
     parser.add_argument("--metadata-only", action="store_true",
                         help="Download config/index/tokenizer and write a plan; do not download weights")
     parser.add_argument("--force-download", action="store_true", help="Replace cached files from the pinned source")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.local_model_dir is not None and (
+            args.metadata_only or args.force_download or args.revision != "main"):
+        parser.error("--local-model-dir cannot be combined with remote download options")
     try:
-        artifact, result = prepare_bundle(args.output_dir, args.revision, args.metadata_only, args.force_download)
+        if args.local_model_dir is not None:
+            artifact, result = write_local_audit(args.local_model_dir, args.output_dir)
+        else:
+            artifact, result = prepare_bundle(
+                args.output_dir, args.revision, args.metadata_only, args.force_download)
     except BundleError as error:
         print(f"Bundle validation failed: {error}", file=sys.stderr)
         return 1
@@ -225,9 +314,17 @@ def main():
               "existing Hugging Face login, and access to the official gated repository. "
               "No completed manifest was created by this attempt.", file=sys.stderr)
         return 1
-    print(json.dumps({"status": result["status"], "revision": result["revision"],
-                      "artifact": str(artifact), "required_weight_shards": result["required_weight_shards"]},
-                     ensure_ascii=False, indent=2))
+    summary = {"status": result["status"], "revision": result["revision"],
+               "artifact": str(artifact)}
+    if args.local_model_dir is not None:
+        summary.update({
+            "layer0_assets_complete": result["layer0_assets_complete"],
+            "full_model_files_complete": result["full_model_files_complete"],
+            "missing_full_model_shards": result["missing_full_model_shards"],
+        })
+    else:
+        summary["required_weight_shards"] = result["required_weight_shards"]
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0
 
 

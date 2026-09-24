@@ -2,15 +2,21 @@
 
 import copy
 import hashlib
+import io
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 
+import torch
+from safetensors.torch import save_file
+
 from python.prepare_llama3_model import (
     BundleError, MANIFEST, PLAN, REPO_ID, REQUIRED_TENSORS,
-    prepare_bundle, select_tensors, validate_config,
+    audit_local_bundle, main, prepare_bundle, select_tensors, validate_config,
+    write_local_audit,
 )
 
 
@@ -23,6 +29,25 @@ CONFIG = {
     "torch_dtype": "bfloat16", "rope_theta": 500000.0,
     "rope_scaling": None, "attention_bias": False, "mlp_bias": False,
 }
+
+
+def write_local_fixture(root: Path) -> Path:
+    model = root / "model"
+    model.mkdir()
+    (model / "config.json").write_text(json.dumps(CONFIG), encoding="utf-8")
+    tensors = {name: torch.zeros(1, dtype=torch.bfloat16)
+               for name in REQUIRED_TENSORS}
+    save_file(tensors, model / "model-00001-of-00004.safetensors")
+    weight_map = {name: "model-00001-of-00004.safetensors"
+                  for name in REQUIRED_TENSORS}
+    weight_map["model.layers.31.mlp.down_proj.weight"] = (
+        "model-00004-of-00004.safetensors")
+    (model / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weight_map}), encoding="utf-8")
+    for name in ("tokenizer.json", "tokenizer_config.json",
+                 "special_tokens_map.json"):
+        (model / name).write_text("{}", encoding="utf-8")
+    return model
 
 
 class FakeHub:
@@ -71,6 +96,60 @@ class FakeHub:
 
 
 class PrepareLlama3ModelTest(unittest.TestCase):
+    def test_local_audit_separates_layer0_from_full_model_completeness(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            model = write_local_fixture(root)
+            path, report = write_local_audit(model, root / "audit")
+            self.assertEqual(path.name, "local-model-audit.json")
+            self.assertEqual(report["status"], "identity_unverified")
+            self.assertTrue(report["layer0_assets_complete"])
+            self.assertFalse(report["full_model_files_complete"])
+            self.assertEqual(report["missing_full_model_shards"],
+                             ["model-00004-of-00004.safetensors"])
+            self.assertIsNone(report["revision"])
+
+    def test_local_audit_rejects_truncated_layer0_shard(self):
+        with tempfile.TemporaryDirectory() as temp:
+            model = write_local_fixture(Path(temp))
+            shard = model / "model-00001-of-00004.safetensors"
+            shard.write_bytes(shard.read_bytes()[:-1])
+            with self.assertRaisesRegex(BundleError, "不完整|大小"):
+                audit_local_bundle(model)
+
+    def test_local_audit_rejects_missing_layer0_shard(self):
+        with tempfile.TemporaryDirectory() as temp:
+            model = write_local_fixture(Path(temp))
+            (model / "model-00001-of-00004.safetensors").unlink()
+            with self.assertRaisesRegex(BundleError, "第0层"):
+                audit_local_bundle(model)
+
+    def test_local_audit_cli_writes_report_and_rejects_remote_flags(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            model = write_local_fixture(root)
+            output = root / "audit"
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(main([
+                    "--local-model-dir", str(model),
+                    "--output-dir", str(output),
+                ]), 0)
+            self.assertTrue((output / "local-model-audit.json").is_file())
+            for forbidden in ("--metadata-only", "--force-download"):
+                with self.subTest(forbidden=forbidden), redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        main([
+                            "--local-model-dir", str(model),
+                            "--output-dir", str(output),
+                            forbidden,
+                        ])
+            with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                main([
+                        "--local-model-dir", str(model),
+                        "--output-dir", str(output),
+                        "--revision", "main-override",
+                    ])
+
     def test_complete_bundle_pins_revision_selects_index_shards_and_hashes_all_files(self):
         hub = FakeHub()
         with tempfile.TemporaryDirectory() as temp:
