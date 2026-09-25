@@ -1,0 +1,52 @@
+{
+  "candidate_manifest_sha256": "fba4156928c94e34f1f0cc5ab362d6126d8d6ee6079963940db039ca696b4b42",
+  "current_rom": {
+    "sin_sha256": "c98a462fa05fc69845acbe8b6175a1ec854ac91e1fb5b4a33e2aa7f84271fc5d",
+    "cos_sha256": "d30190cd0886513845147a77baac3a3453598a617e86f580f1ab25234db5bd3d"
+  },
+  "counts": {
+    "sin": 3,
+    "cos": 1,
+    "total": 4
+  },
+  "mismatches": [
+    {
+      "table": "sine",
+      "flat_index": 2758,
+      "position": 43,
+      "frequency_index": 6,
+      "current_word": "BA17",
+      "candidate_word": "BA16",
+      "current_matches_numpy_fp64": true
+    },
+    {
+      "table": "sine",
+      "flat_index": 5192,
+      "position": 81,
+      "frequency_index": 8,
+      "current_word": "3968",
+      "candidate_word": "3966",
+      "current_matches_numpy_fp64": true
+    },
+    {
+      "table": "sine",
+      "flat_index": 5510,
+      "position": 86,
+      "frequency_index": 6,
+      "current_word": "BA97",
+      "candidate_word": "BA96",
+      "current_matches_numpy_fp64": true
+    },
+    {
+      "table": "cosine",
+      "flat_index": 7746,
+      "position": 121,
+      "frequency_index": 2,
+      "current_word": "3E3C",
+      "candidate_word": "3E3D",
+      "current_matches_numpy_fp64": true
+    }
+  ],
+  "precision_diagnosis": "current_rom_matches_numpy_fp64",
+  "decision": "user_confirmation_required"
+}
