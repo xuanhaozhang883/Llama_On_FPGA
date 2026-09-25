@@ -8,6 +8,7 @@ import tempfile
 import unittest
 import zlib
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
@@ -26,6 +27,8 @@ from python.attention_protocol import (
     validate_request_payloads,
 )
 from python.fpga_attention_client import (
+    AttentionClient,
+    AttentionClientError,
     AttentionServerError,
     AttentionTransportError,
     ContextResponse,
@@ -135,6 +138,55 @@ class RecordingSendSocket:
 
     def close(self):
         self.close_calls += 1
+
+
+class ClientSocketDouble:
+    def __init__(self, recv_chunks=(), fail_send_call=None,
+                 send_failure=None, settimeout_failure=None,
+                 close_failure=None, fail_recv_call=None,
+                 recv_failure=None):
+        self.recv_chunks = list(recv_chunks)
+        self.sent = []
+        self.send_attempts = 0
+        self.recv_attempts = 0
+        self.fail_send_call = fail_send_call
+        self.send_failure = (
+            send_failure or socket.timeout("simulated send timeout"))
+        self.settimeout_failure = settimeout_failure
+        self.close_failure = close_failure
+        self.fail_recv_call = fail_recv_call
+        self.recv_failure = (
+            recv_failure or socket.timeout("simulated recv timeout"))
+        self.close_calls = 0
+        self.timeout = None
+
+    def settimeout(self, value):
+        if self.settimeout_failure is not None:
+            raise self.settimeout_failure
+        self.timeout = value
+
+    def sendall(self, data):
+        self.send_attempts += 1
+        if self.send_attempts == self.fail_send_call:
+            raise self.send_failure
+        self.sent.append(bytes(data))
+
+    def recv(self, size):
+        self.recv_attempts += 1
+        if self.recv_attempts == self.fail_recv_call:
+            raise self.recv_failure
+        if not self.recv_chunks:
+            return b""
+        chunk = self.recv_chunks.pop(0)
+        if len(chunk) <= size:
+            return chunk
+        self.recv_chunks.insert(0, chunk[size:])
+        return chunk[:size]
+
+    def close(self):
+        self.close_calls += 1
+        if self.close_failure is not None:
+            raise self.close_failure
 
 
 def response_bytes(
@@ -380,6 +432,186 @@ class ResponseReceiveTest(unittest.TestCase):
             with self.assertRaises(AttentionTransportError):
                 recv_context_response(crc_sock, 7, 3)
             self.assertEqual(crc_sock.close_calls, 0)
+
+
+class AttentionClientStateTest(unittest.TestCase):
+    def assert_transaction_failure_closes(
+            self, sock, prepared,
+            expected_exception=AttentionClientError):
+        client = AttentionClient(sock)
+        with self.assertRaises(expected_exception):
+            client.run_request(prepared, request_id=7)
+        self.assertTrue(client.closed)
+        self.assertEqual(sock.close_calls, 1)
+        sent_before_retry = list(sock.sent)
+        with self.assertRaises(AttentionClientError):
+            client.run_request(prepared, request_id=8)
+        self.assertEqual(sock.sent, sent_before_retry)
+
+    def test_two_successful_transactions_reuse_connection_and_close_is_idempotent(self):
+        context = bytes(range(256)) * (CONTEXT_BYTES // 256)
+        with tempfile.TemporaryDirectory() as temp:
+            output, _ = write_prepared_fixture(Path(temp), valid_tokens=3)
+            prepared = load_prepared_inputs(output)
+            first_header, first_payload = response_bytes(context, request_id=1)
+            second_header, second_payload = response_bytes(context, request_id=2)
+            sock = ClientSocketDouble([
+                first_header, first_payload, second_header, second_payload,
+            ])
+            client = AttentionClient(sock)
+            first = client.run_request(prepared, request_id=1)
+            second = client.run_request(prepared, request_id=2)
+            self.assertEqual(first.context_payload, context)
+            self.assertEqual(second.context_payload, context)
+            self.assertFalse(client.closed)
+            client.close()
+            client.close()
+            self.assertTrue(client.closed)
+            self.assertEqual(sock.close_calls, 1)
+
+    def test_local_validation_failure_keeps_ready_connection_usable(self):
+        context = bytes(range(256)) * (CONTEXT_BYTES // 256)
+        with tempfile.TemporaryDirectory() as temp:
+            output, _ = write_prepared_fixture(Path(temp), valid_tokens=3)
+            prepared = load_prepared_inputs(output)
+            raw_header, payload = response_bytes(context, request_id=7)
+            sock = ClientSocketDouble([raw_header, payload])
+            client = AttentionClient(sock)
+            with self.assertRaises(InputValidationError):
+                client.run_request(prepared, request_id=-1)
+            self.assertFalse(client.closed)
+            self.assertEqual(sock.sent, [])
+            response = client.run_request(prepared, request_id=7)
+            self.assertEqual(response.context_payload, context)
+            self.assertFalse(client.closed)
+
+    def test_each_header_q_k_v_send_failure_closes_without_retry(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output, _ = write_prepared_fixture(Path(temp), valid_tokens=3)
+            prepared = load_prepared_inputs(output)
+            for call_number, label in enumerate(
+                    ("header", "Q", "K", "V"), start=1):
+                with self.subTest(label=label):
+                    sock = ClientSocketDouble(fail_send_call=call_number)
+                    self.assert_transaction_failure_closes(
+                        sock, prepared, AttentionTransportError)
+
+    def test_receive_timeout_eof_crc_and_server_error_close_without_retry(self):
+        context = bytes(range(256)) * (CONTEXT_BYTES // 256)
+        good_header, good_payload = response_bytes(context)
+        corrupted = bytearray(good_payload)
+        corrupted[-1] ^= 0xFF
+        error_header, _ = response_bytes(
+            b"", status=StatusCode.BUSY, detail_code=1)
+        cases = (
+            ("header_timeout", ClientSocketDouble(fail_recv_call=1),
+             AttentionTransportError),
+            ("header_eof", ClientSocketDouble([b"short", b""]),
+             AttentionTransportError),
+            ("context_eof", ClientSocketDouble(
+                [good_header, good_payload[:12345], b""]),
+             AttentionTransportError),
+            ("context_crc", ClientSocketDouble(
+                [good_header, bytes(corrupted)]),
+             AttentionTransportError),
+            ("server_busy", ClientSocketDouble([error_header]),
+             AttentionServerError),
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            output, _ = write_prepared_fixture(Path(temp), valid_tokens=3)
+            prepared = load_prepared_inputs(output)
+            for label, sock, exception_type in cases:
+                with self.subTest(label=label):
+                    self.assert_transaction_failure_closes(
+                        sock, prepared, exception_type)
+
+    def test_in_flight_request_is_rejected_without_socket_io(self):
+        sock = ClientSocketDouble()
+        client = AttentionClient(sock)
+        client._state = "IN_FLIGHT"
+        with tempfile.TemporaryDirectory() as temp:
+            output, _ = write_prepared_fixture(Path(temp), valid_tokens=3)
+            prepared = load_prepared_inputs(output)
+            with self.assertRaisesRegex(AttentionClientError, "在途"):
+                client.run_request(prepared, request_id=7)
+        self.assertEqual(sock.sent, [])
+        self.assertFalse(client.closed)
+
+    def test_socket_close_error_does_not_mask_primary_transaction_error(self):
+        sock = ClientSocketDouble(
+            fail_send_call=1,
+            send_failure=socket.timeout("primary timeout"),
+            close_failure=OSError("secondary close failure"),
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            output, _ = write_prepared_fixture(Path(temp), valid_tokens=3)
+            prepared = load_prepared_inputs(output)
+            client = AttentionClient(sock)
+            with self.assertRaises(AttentionTransportError) as raised:
+                client.run_request(prepared, request_id=7)
+            self.assertIsInstance(raised.exception.__cause__, socket.timeout)
+            self.assertTrue(client.closed)
+
+    def test_connect_sets_timeouts_and_uses_keyword_connect_timeout(self):
+        sock = ClientSocketDouble()
+        with patch(
+                "python.fpga_attention_client.socket.create_connection",
+                return_value=sock) as create_connection:
+            client = AttentionClient.connect(
+                "127.0.0.1", 5001, connect_timeout=1.5,
+                io_timeout=2.5)
+        create_connection.assert_called_once_with(
+            ("127.0.0.1", 5001), timeout=1.5)
+        self.assertEqual(sock.timeout, 2.5)
+        client.close()
+
+    def test_connect_wraps_oserror_and_socket_timeout(self):
+        for cause in (OSError("refused"), socket.timeout("timed out")):
+            with self.subTest(cause=type(cause).__name__), patch(
+                    "python.fpga_attention_client.socket.create_connection",
+                    side_effect=cause):
+                with self.assertRaises(AttentionTransportError) as raised:
+                    AttentionClient.connect("127.0.0.1")
+                self.assertIs(raised.exception.__cause__, cause)
+
+    def test_connect_rejects_invalid_values_before_network_io(self):
+        invalid_calls = (
+            ("", 5001, 1.0, 1.0),
+            ("127.0.0.1", 0, 1.0, 1.0),
+            ("127.0.0.1", 65536, 1.0, 1.0),
+            ("127.0.0.1", 5001, True, 1.0),
+            ("127.0.0.1", 5001, 1.0, True),
+            ("127.0.0.1", 5001, 0.0, 1.0),
+            ("127.0.0.1", 5001, 1.0, float("inf")),
+            ("127.0.0.1", 5001, float("nan"), 1.0),
+        )
+        for host, port, connect_timeout, io_timeout in invalid_calls:
+            with self.subTest(
+                    host=host,
+                    port=port,
+                    connect_timeout=connect_timeout,
+                    io_timeout=io_timeout), patch(
+                        "python.fpga_attention_client.socket.create_connection"
+                    ) as create:
+                with self.assertRaises(ValueError):
+                    AttentionClient.connect(
+                        host, port, connect_timeout=connect_timeout,
+                        io_timeout=io_timeout)
+                create.assert_not_called()
+
+    def test_settimeout_failure_closes_socket_and_preserves_primary_cause(self):
+        primary = OSError("settimeout failed")
+        sock = ClientSocketDouble(
+            settimeout_failure=primary,
+            close_failure=OSError("close failed"),
+        )
+        with patch(
+                "python.fpga_attention_client.socket.create_connection",
+                return_value=sock):
+            with self.assertRaises(AttentionTransportError) as raised:
+                AttentionClient.connect("127.0.0.1")
+        self.assertIs(raised.exception.__cause__, primary)
+        self.assertEqual(sock.close_calls, 1)
 
 
 class PreparedInputsTest(unittest.TestCase):

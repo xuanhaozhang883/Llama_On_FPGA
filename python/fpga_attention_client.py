@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 import socket
@@ -296,3 +297,88 @@ def load_prepared_inputs(input_dir: Path) -> PreparedInputs:
     )
     _validate_prepared_inputs(prepared)
     return prepared
+
+
+class AttentionClient:
+    """顺序复用单一TCP连接的Attention事务客户端；非线程安全。"""
+
+    def __init__(self, sock):
+        self._sock = sock
+        self._state = "READY"
+
+    @classmethod
+    def connect(
+            cls,
+            host: str,
+            port: int = 5001,
+            *,
+            connect_timeout: float = 5.0,
+            io_timeout: float = 60.0) -> "AttentionClient":
+        if not isinstance(host, str) or not host:
+            raise ValueError("host必须是非空字符串")
+        if type(port) is not int or not 1 <= port <= 65535:
+            raise ValueError("port必须在1～65535之间")
+        for name, value in (("connect_timeout", connect_timeout),
+                            ("io_timeout", io_timeout)):
+            if (type(value) not in (int, float) or value <= 0 or
+                    (type(value) is float and not math.isfinite(value))):
+                raise ValueError(f"{name}必须是有限正数")
+        sock = None
+        try:
+            sock = socket.create_connection(
+                (host, port), timeout=connect_timeout)
+            sock.settimeout(io_timeout)
+        except (OSError, socket.timeout) as error:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+            raise AttentionTransportError(
+                f"无法连接Attention服务器{host}:{port}") from error
+        return cls(sock)
+
+    @property
+    def closed(self) -> bool:
+        return self._state == "CLOSED"
+
+    def close(self) -> None:
+        if self._state != "CLOSED":
+            self._state = "CLOSED"
+            try:
+                self._sock.close()
+            except OSError:
+                # Socket已经不可复用；关闭异常不能遮蔽原事务异常。
+                pass
+
+    def __enter__(self):
+        if self.closed:
+            raise AttentionClientError("客户端已经关闭")
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.close()
+        return False
+
+    def run_request(
+            self,
+            prepared_inputs: PreparedInputs,
+            request_id: int) -> ContextResponse:
+        if self._state == "CLOSED":
+            raise AttentionClientError("客户端已经关闭")
+        if self._state == "IN_FLIGHT":
+            raise AttentionClientError("已有Attention请求在途")
+
+        header, header_bytes = _build_request(prepared_inputs, request_id)
+        self._state = "IN_FLIGHT"
+        try:
+            _send_request_bytes(
+                self._sock, header_bytes, prepared_inputs,
+                header.request_id)
+            response = recv_context_response(
+                self._sock, header.request_id, header.valid_tokens)
+        except Exception:
+            self.close()
+            raise
+        self._state = "READY"
+        return response
