@@ -170,6 +170,10 @@ class AttentionProtocolTest(unittest.TestCase):
             unpack_response_header(bytes(raw))
         self.assertEqual(raised.exception.status_code, StatusCode.BAD_HEADER)
 
+        with self.assertRaises(ProtocolError) as raised:
+            pack_response_header(replace(good, detail_code=1))
+        self.assertEqual(raised.exception.status_code, StatusCode.BAD_HEADER)
+
     def test_c_header_and_document_share_frozen_constants(self):
         header_text = (ROOT / "vitis" / "attention_server" / "src" /
                        "attention_protocol.h").read_text(encoding="utf-8")

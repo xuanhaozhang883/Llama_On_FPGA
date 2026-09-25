@@ -209,6 +209,8 @@ def _validate_response_fields(header: ResponseHeader) -> None:
         raise ProtocolError(StatusCode.BAD_HEADER, "未知status_code") from exc
 
     if status is StatusCode.OK:
+        if header.detail_code != 0:
+            raise ProtocolError(StatusCode.BAD_HEADER, "成功响应的detail_code必须为0")
         if not MIN_VALID_TOKENS <= header.valid_tokens <= MAX_VALID_TOKENS:
             raise ProtocolError(StatusCode.BAD_VALID_TOKENS, "成功响应的valid_tokens必须在1～128之间")
         if header.context_bytes != CONTEXT_BYTES:
