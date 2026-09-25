@@ -2,9 +2,12 @@
 
 from dataclasses import replace
 import hashlib
+import itertools
 import json
+import queue
 import socket
 import tempfile
+import threading
 import unittest
 import zlib
 from pathlib import Path
@@ -16,6 +19,7 @@ from python.attention_protocol import (
     CONTEXT_BYTES,
     K_BYTES,
     Q_BYTES,
+    REQUEST_HEADER_BYTES,
     RESPONSE_HEADER_BYTES,
     V_BYTES,
     ProtocolError,
@@ -187,6 +191,122 @@ class ClientSocketDouble:
         self.close_calls += 1
         if self.close_failure is not None:
             raise self.close_failure
+
+
+def server_recv_exact(conn, size):
+    data = bytearray()
+    while len(data) < size:
+        chunk = conn.recv(size - len(data))
+        if not chunk:
+            raise AssertionError(
+                f"client closed after {len(data)} of {size} server bytes")
+        data.extend(chunk)
+    return bytes(data)
+
+
+class LoopbackAttentionServer:
+    def __init__(self, handler):
+        self.handler = handler
+        self.ready = threading.Event()
+        self.errors = queue.Queue()
+        self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.listener.settimeout(2.0)
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen(1)
+        self.port = self.listener.getsockname()[1]
+        self.connection = None
+
+    def __enter__(self):
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+        if not self.ready.wait(timeout=2.0):
+            try:
+                self.listener.close()
+            except OSError:
+                pass
+            self.thread.join(timeout=2.0)
+            raise AssertionError("loopback server did not become ready")
+        return self
+
+    def _run(self):
+        self.ready.set()
+        try:
+            self.connection, _ = self.listener.accept()
+            self.connection.settimeout(2.0)
+            with self.connection:
+                self.handler(self.connection)
+        except BaseException as error:
+            self.errors.put(error)
+
+    def __exit__(self, exc_type, exc, traceback):
+        if self.connection is not None:
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                self.connection.close()
+            except OSError:
+                pass
+        try:
+            self.listener.close()
+        except OSError:
+            pass
+        self.thread.join(timeout=2.0)
+        thread_error = None if self.errors.empty() else self.errors.get()
+        if exc_type is None:
+            if self.thread.is_alive():
+                raise AssertionError("loopback server thread did not stop")
+            if thread_error is not None:
+                raise thread_error
+        else:
+            if self.thread.is_alive():
+                exc.add_note(
+                    "loopback server thread did not stop during cleanup")
+            if thread_error is not None:
+                exc.add_note(
+                    "loopback server cleanup error: "
+                    f"{type(thread_error).__name__}: {thread_error}")
+
+
+def send_chunks(conn, data, sizes):
+    offset = 0
+    for size in sizes:
+        if offset >= len(data):
+            break
+        conn.sendall(data[offset:offset + size])
+        offset += size
+    if offset < len(data):
+        conn.sendall(data[offset:])
+
+
+def receive_and_validate_request(conn, prepared):
+    header = unpack_request_header(
+        server_recv_exact(conn, REQUEST_HEADER_BYTES))
+    payloads = (
+        server_recv_exact(conn, Q_BYTES),
+        server_recv_exact(conn, K_BYTES),
+        server_recv_exact(conn, V_BYTES),
+    )
+    validate_request_payloads(header, *payloads)
+    if payloads != (
+            prepared.q_payload, prepared.k_payload,
+            prepared.v_payload):
+        raise AssertionError("loopback request payload differs from fixture")
+    return header
+
+
+def success_wire(header, context):
+    response = ResponseHeader(
+        request_id=header.request_id,
+        status_code=StatusCode.OK,
+        valid_tokens=header.valid_tokens,
+        context_bytes=CONTEXT_BYTES,
+        context_crc32=crc32(context),
+        fpga_status=0x6D,
+        detail_code=0,
+    )
+    return pack_response_header(response) + context
 
 
 def response_bytes(
@@ -612,6 +732,274 @@ class AttentionClientStateTest(unittest.TestCase):
                 AttentionClient.connect("127.0.0.1")
         self.assertIs(raised.exception.__cause__, primary)
         self.assertEqual(sock.close_calls, 1)
+
+
+class LoopbackAttentionClientTest(unittest.TestCase):
+    def assert_loopback_failure(
+            self, prepared, raw_response, expected_exception,
+            *, io_timeout=1.0):
+        def handler(conn):
+            receive_and_validate_request(conn, prepared)
+            conn.sendall(raw_response)
+
+        with LoopbackAttentionServer(handler) as server:
+            client = AttentionClient.connect(
+                "127.0.0.1", server.port,
+                connect_timeout=1.0, io_timeout=io_timeout)
+            with self.assertRaises(expected_exception):
+                client.run_request(prepared, request_id=7)
+            self.assertTrue(client.closed)
+            with self.assertRaises(AttentionClientError):
+                client.run_request(prepared, request_id=8)
+
+    def test_single_request_over_real_tcp(self):
+        context = bytes(range(256)) * (CONTEXT_BYTES // 256)
+        with tempfile.TemporaryDirectory() as temp:
+            output, _ = write_prepared_fixture(Path(temp), valid_tokens=3)
+            prepared = load_prepared_inputs(output)
+
+            def handler(conn):
+                raw_header = server_recv_exact(conn, REQUEST_HEADER_BYTES)
+                header = unpack_request_header(raw_header)
+                q = server_recv_exact(conn, Q_BYTES)
+                k = server_recv_exact(conn, K_BYTES)
+                v = server_recv_exact(conn, V_BYTES)
+                validate_request_payloads(header, q, k, v)
+                self.assertEqual(
+                    (q, k, v),
+                    (prepared.q_payload, prepared.k_payload,
+                     prepared.v_payload),
+                )
+                response = ResponseHeader(
+                    request_id=header.request_id,
+                    status_code=StatusCode.OK,
+                    valid_tokens=header.valid_tokens,
+                    context_bytes=CONTEXT_BYTES,
+                    context_crc32=crc32(context),
+                    fpga_status=0x6D,
+                    detail_code=0,
+                )
+                conn.sendall(pack_response_header(response) + context)
+
+            with LoopbackAttentionServer(handler) as server:
+                with AttentionClient.connect(
+                        "127.0.0.1", server.port,
+                        connect_timeout=1.0, io_timeout=1.0) as client:
+                    result = client.run_request(prepared, request_id=7)
+            self.assertEqual(result.context_payload, context)
+
+    def test_real_tcp_accepts_coalesced_and_deterministically_chunked_responses(self):
+        context = bytes(range(256)) * (CONTEXT_BYTES // 256)
+        pattern = [1, 7, 64, 1023, 4096, 16384]
+        irregular_sizes = list(
+            itertools.islice(itertools.cycle(pattern), 512))
+        modes = ("coalesced", "byte_header", "irregular")
+        with tempfile.TemporaryDirectory() as temp:
+            output, _ = write_prepared_fixture(Path(temp), valid_tokens=3)
+            prepared = load_prepared_inputs(output)
+            for mode in modes:
+                with self.subTest(mode=mode):
+                    def handler(conn, selected=mode):
+                        header = receive_and_validate_request(conn, prepared)
+                        wire = success_wire(header, context)
+                        if selected == "coalesced":
+                            conn.sendall(wire)
+                        elif selected == "byte_header":
+                            send_chunks(
+                                conn, wire[:RESPONSE_HEADER_BYTES], [1] * 32)
+                            conn.sendall(wire[RESPONSE_HEADER_BYTES:])
+                        else:
+                            send_chunks(conn, wire, irregular_sizes)
+
+                    with LoopbackAttentionServer(handler) as server:
+                        with AttentionClient.connect(
+                                "127.0.0.1", server.port,
+                                connect_timeout=1.0,
+                                io_timeout=1.0) as client:
+                            result = client.run_request(
+                                prepared, request_id=7)
+                    self.assertEqual(result.context_payload, context)
+
+    def test_event_gated_fragment_pause_does_not_break_transaction(self):
+        context = bytes(range(256)) * (CONTEXT_BYTES // 256)
+        first_byte_sent = threading.Event()
+        release_remaining = threading.Event()
+        outcomes = queue.Queue()
+        with tempfile.TemporaryDirectory() as temp:
+            output, _ = write_prepared_fixture(Path(temp), valid_tokens=3)
+            prepared = load_prepared_inputs(output)
+
+            def handler(conn):
+                header = receive_and_validate_request(conn, prepared)
+                wire = success_wire(header, context)
+                conn.sendall(wire[:1])
+                first_byte_sent.set()
+                if not release_remaining.wait(timeout=2.0):
+                    raise AssertionError(
+                        "test did not release fragmented response")
+                conn.sendall(wire[1:])
+
+            with LoopbackAttentionServer(handler) as server:
+                client = AttentionClient.connect(
+                    "127.0.0.1", server.port,
+                    connect_timeout=1.0, io_timeout=1.0)
+
+                def run_client():
+                    try:
+                        outcomes.put(client.run_request(
+                            prepared, request_id=7))
+                    except BaseException as error:
+                        outcomes.put(error)
+
+                worker = threading.Thread(target=run_client, daemon=True)
+                worker.start()
+                try:
+                    self.assertTrue(first_byte_sent.wait(timeout=2.0))
+                    self.assertTrue(worker.is_alive())
+                    release_remaining.set()
+                    worker.join(timeout=2.0)
+                    self.assertFalse(worker.is_alive())
+                    outcome = outcomes.get_nowait()
+                    if isinstance(outcome, BaseException):
+                        raise outcome
+                    self.assertEqual(outcome.context_payload, context)
+                finally:
+                    release_remaining.set()
+                    client.close()
+                    worker.join(timeout=2.0)
+
+    def test_real_tcp_maps_server_statuses_and_rejects_mismatched_identity(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output, _ = write_prepared_fixture(Path(temp), valid_tokens=3)
+            prepared = load_prepared_inputs(output)
+            cases = []
+            for status, request_id, valid_tokens in (
+                    (StatusCode.BAD_CRC, 7, 3),
+                    (StatusCode.BUSY, 7, 3),
+                    (StatusCode.RUN_TIMEOUT, 7, 3),
+                    (StatusCode.BAD_MAGIC, 0, 0),
+                    (StatusCode.INTERNAL_ERROR, 0, 3),
+                    (StatusCode.RESET_TIMEOUT, 7, 0)):
+                raw_header, _ = response_bytes(
+                    b"", request_id=request_id,
+                    valid_tokens=valid_tokens,
+                    status=status, detail_code=1)
+                cases.append((
+                    status.name, raw_header, AttentionServerError))
+            mismatched, _ = response_bytes(
+                b"", request_id=8, valid_tokens=3,
+                status=StatusCode.BUSY, detail_code=1)
+            cases.append((
+                "mismatched_id", mismatched, AttentionTransportError))
+            mismatched_tokens, _ = response_bytes(
+                b"", request_id=7, valid_tokens=4,
+                status=StatusCode.BUSY, detail_code=1)
+            cases.append((
+                "mismatched_valid_tokens",
+                mismatched_tokens,
+                AttentionTransportError,
+            ))
+            for label, raw_response, expected_exception in cases:
+                with self.subTest(label=label):
+                    self.assert_loopback_failure(
+                        prepared, raw_response, expected_exception)
+
+    def test_real_tcp_rejects_each_malformed_response_field(self):
+        context = bytes(range(256)) * (CONTEXT_BYTES // 256)
+        good_header, _ = response_bytes(context)
+        malformed_headers = (
+            ("magic", overwrite_header_field(good_header, 0, b"NOPE")),
+            ("version", overwrite_header_field(
+                good_header, 4, b"\x02")),
+            ("command", overwrite_header_field(
+                good_header, 5, b"\x03")),
+            ("header_bytes", overwrite_header_field(
+                good_header, 6, (31).to_bytes(2, "little"))),
+            ("context_bytes", overwrite_header_field(
+                good_header, 16,
+                (CONTEXT_BYTES - 2).to_bytes(4, "little"))),
+            ("detail_code", overwrite_header_field(
+                good_header, 28, (1).to_bytes(4, "little"))),
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            output, _ = write_prepared_fixture(Path(temp), valid_tokens=3)
+            prepared = load_prepared_inputs(output)
+            for label, raw_header in malformed_headers:
+                with self.subTest(label=label):
+                    self.assert_loopback_failure(
+                        prepared, raw_header, AttentionTransportError)
+
+    def test_real_tcp_rejects_truncated_and_corrupt_context(self):
+        context = bytes(range(256)) * (CONTEXT_BYTES // 256)
+        raw_header, payload = response_bytes(context)
+        corrupt = bytearray(payload)
+        corrupt[-1] ^= 0xFF
+        cases = (
+            ("truncated", raw_header + payload[:CONTEXT_BYTES // 2]),
+            ("crc", raw_header + bytes(corrupt)),
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            output, _ = write_prepared_fixture(Path(temp), valid_tokens=3)
+            prepared = load_prepared_inputs(output)
+            for label, raw_response in cases:
+                with self.subTest(label=label):
+                    self.assert_loopback_failure(
+                        prepared, raw_response, AttentionTransportError)
+
+    def test_real_tcp_no_response_times_out_without_fixed_sleep(self):
+        request_received = threading.Event()
+        release_server = threading.Event()
+        with tempfile.TemporaryDirectory() as temp:
+            output, _ = write_prepared_fixture(Path(temp), valid_tokens=3)
+            prepared = load_prepared_inputs(output)
+
+            def handler(conn):
+                receive_and_validate_request(conn, prepared)
+                request_received.set()
+                if not release_server.wait(timeout=2.0):
+                    raise AssertionError(
+                        "test did not release no-response server")
+
+            with LoopbackAttentionServer(handler) as server:
+                client = AttentionClient.connect(
+                    "127.0.0.1", server.port,
+                    connect_timeout=1.0, io_timeout=0.3)
+                try:
+                    with self.assertRaises(AttentionTransportError):
+                        client.run_request(prepared, request_id=7)
+                    self.assertTrue(request_received.is_set())
+                    self.assertTrue(client.closed)
+                finally:
+                    release_server.set()
+                    client.close()
+
+    def test_ten_requests_reuse_one_real_tcp_connection_in_order(self):
+        context = bytes(range(256)) * (CONTEXT_BYTES // 256)
+        with tempfile.TemporaryDirectory() as temp:
+            output, _ = write_prepared_fixture(Path(temp), valid_tokens=3)
+            prepared = load_prepared_inputs(output)
+
+            def handler(conn):
+                for expected_id in range(1, 11):
+                    header = receive_and_validate_request(conn, prepared)
+                    self.assertEqual(header.request_id, expected_id)
+                    wire = success_wire(header, context)
+                    conn.sendall(wire[:RESPONSE_HEADER_BYTES])
+                    send_chunks(
+                        conn, wire[RESPONSE_HEADER_BYTES:], [4096] * 256)
+
+            with LoopbackAttentionServer(handler) as server:
+                with AttentionClient.connect(
+                        "127.0.0.1", server.port,
+                        connect_timeout=1.0, io_timeout=1.0) as client:
+                    results = [
+                        client.run_request(
+                            prepared, request_id=request_id)
+                        for request_id in range(1, 11)
+                    ]
+            self.assertEqual(len(results), 10)
+            self.assertTrue(all(
+                result.context_payload == context for result in results))
 
 
 class PreparedInputsTest(unittest.TestCase):
