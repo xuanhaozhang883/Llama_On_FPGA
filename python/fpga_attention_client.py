@@ -15,8 +15,16 @@ from .attention_protocol import (
     K_BYTES,
     MAX_VALID_TOKENS,
     Q_BYTES,
+    RESPONSE_HEADER_BYTES,
     V_BYTES,
+    ProtocolError,
+    RequestHeader,
+    ResponseHeader,
+    StatusCode,
     crc32,
+    make_request_header,
+    pack_request_header,
+    unpack_response_header,
 )
 
 
@@ -33,7 +41,20 @@ class AttentionTransportError(AttentionClientError):
 
 
 class AttentionServerError(AttentionClientError):
-    """PS端返回非成功状态。"""
+    """PS端返回非成功状态，并保留结构化诊断字段。"""
+
+    def __init__(self, header: ResponseHeader):
+        self.header = header
+        self.status_code = header.status_code
+        self.request_id = header.request_id
+        self.valid_tokens = header.valid_tokens
+        self.fpga_status = header.fpga_status
+        self.detail_code = header.detail_code
+        super().__init__(
+            f"Attention服务器返回{header.status_code.name}："
+            f"request_id={header.request_id}，"
+            f"fpga_status=0x{header.fpga_status:08x}，"
+            f"detail_code={header.detail_code}")
 
 
 @dataclass(frozen=True)
@@ -45,6 +66,12 @@ class PreparedInputs:
     source_dir: Path
 
 
+@dataclass(frozen=True)
+class ContextResponse:
+    header: ResponseHeader
+    context_payload: bytes
+
+
 _INPUT_FILES = {
     "q": ("q_before_rope_bf16.bin", (32, 128, 128), Q_BYTES),
     "k": ("k_before_rope_bf16.bin", (8, 128, 128), K_BYTES),
@@ -52,6 +79,25 @@ _INPUT_FILES = {
 }
 _DTYPE = "BF16 round-to-nearest-even, little-endian uint16"
 _LAYOUT = "[head][token][dim] contiguous"
+
+
+def recv_exact(sock, size: int) -> bytes:
+    if type(size) is not int or size < 0:
+        raise ValueError("size必须是非负整数")
+    data = bytearray()
+    while len(data) < size:
+        try:
+            chunk = sock.recv(size - len(data))
+        except (OSError, socket.timeout) as error:
+            raise AttentionTransportError(
+                f"TCP接收失败：expected_bytes={size}，"
+                f"actual_bytes={len(data)}") from error
+        if not chunk:
+            raise AttentionTransportError(
+                f"连接提前关闭：expected_bytes={size}，"
+                f"actual_bytes={len(data)}")
+        data.extend(chunk)
+    return bytes(data)
 
 
 def _validate_prepared_inputs(prepared: PreparedInputs) -> None:
@@ -72,6 +118,114 @@ def _validate_prepared_inputs(prepared: PreparedInputs) -> None:
         if np.any(words[:, prepared.valid_tokens:, :] != 0):
             raise InputValidationError(
                 f"{name}在valid_tokens之后的补零区不是全零")
+
+
+def _build_request(
+        prepared_inputs: PreparedInputs,
+        request_id: int) -> tuple[RequestHeader, bytes]:
+    _validate_prepared_inputs(prepared_inputs)
+    try:
+        header = make_request_header(
+            request_id=request_id,
+            valid_tokens=prepared_inputs.valid_tokens,
+            q_payload=prepared_inputs.q_payload,
+            k_payload=prepared_inputs.k_payload,
+            v_payload=prepared_inputs.v_payload,
+        )
+    except ValueError as error:
+        raise InputValidationError(
+            "request_id或请求载荷不符合TCP v1") from error
+    return header, pack_request_header(header)
+
+
+def _send_request_bytes(
+        sock,
+        header_bytes: bytes,
+        prepared_inputs: PreparedInputs,
+        request_id: int) -> None:
+    for label, payload in (
+        ("请求头", header_bytes),
+        ("Q", prepared_inputs.q_payload),
+        ("K", prepared_inputs.k_payload),
+        ("V", prepared_inputs.v_payload),
+    ):
+        try:
+            sock.sendall(payload)
+        except (OSError, socket.timeout) as error:
+            raise AttentionTransportError(
+                f"发送{label}失败：request_id={request_id}，"
+                f"expected_bytes={len(payload)}，actual_bytes=unknown") from error
+
+
+def send_qkv_request(
+        sock,
+        prepared_inputs: PreparedInputs,
+        request_id: int) -> RequestHeader:
+    header, header_bytes = _build_request(prepared_inputs, request_id)
+    _send_request_bytes(
+        sock, header_bytes, prepared_inputs, header.request_id)
+    return header
+
+
+def recv_context_response(
+        sock,
+        expected_request_id: int,
+        expected_valid_tokens: int) -> ContextResponse:
+    if (type(expected_request_id) is not int or
+            not 0 <= expected_request_id < (1 << 32)):
+        raise InputValidationError("expected_request_id必须是u32整数")
+    if (type(expected_valid_tokens) is not int or
+            not 1 <= expected_valid_tokens <= MAX_VALID_TOKENS):
+        raise InputValidationError("expected_valid_tokens必须在1～128之间")
+    try:
+        raw_header = recv_exact(sock, RESPONSE_HEADER_BYTES)
+    except AttentionTransportError as error:
+        raise AttentionTransportError(
+            f"接收响应头失败：request_id={expected_request_id}，"
+            f"expected_bytes={RESPONSE_HEADER_BYTES}；{error}") from error
+    try:
+        header = unpack_response_header(raw_header)
+    except ProtocolError as error:
+        raise AttentionTransportError(
+            f"Attention响应头不符合TCP v1：request_id={expected_request_id}，"
+            f"expected_bytes={RESPONSE_HEADER_BYTES}，"
+            f"actual_bytes={len(raw_header)}") from error
+
+    if header.status_code is StatusCode.OK:
+        if header.request_id != expected_request_id:
+            raise AttentionTransportError(
+                f"成功响应request_id错误：expected={expected_request_id}，"
+                f"actual={header.request_id}")
+        if header.valid_tokens != expected_valid_tokens:
+            raise AttentionTransportError(
+                f"成功响应valid_tokens错误：request_id={expected_request_id}，"
+                f"expected={expected_valid_tokens}，"
+                f"actual={header.valid_tokens}")
+    else:
+        if header.request_id not in (0, expected_request_id):
+            raise AttentionTransportError(
+                f"错误响应request_id串线：expected=0或{expected_request_id}，"
+                f"actual={header.request_id}")
+        if header.valid_tokens not in (0, expected_valid_tokens):
+            raise AttentionTransportError(
+                f"错误响应valid_tokens串线：request_id={expected_request_id}，"
+                f"expected=0或{expected_valid_tokens}，"
+                f"actual={header.valid_tokens}")
+        raise AttentionServerError(header)
+
+    try:
+        context = recv_exact(sock, header.context_bytes)
+    except AttentionTransportError as error:
+        raise AttentionTransportError(
+            f"接收Context失败：request_id={expected_request_id}，"
+            f"expected_bytes={header.context_bytes}；{error}") from error
+    actual_crc = crc32(context)
+    if actual_crc != header.context_crc32:
+        raise AttentionTransportError(
+            f"Context CRC32错误：request_id={expected_request_id}，"
+            f"expected=0x{header.context_crc32:08x}，"
+            f"actual=0x{actual_crc:08x}")
+    return ContextResponse(header=header, context_payload=context)
 
 
 def _read_manifest(input_dir: Path) -> dict:
